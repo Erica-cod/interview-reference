@@ -12,7 +12,7 @@
 
 > 我理解 BFF 不是简单的接口代理，而是面向特定前端的服务端适配层。传统后端通常围绕用户、订单、库存等领域设计通用接口；BFF 则围绕页面和交互场景，把多个下游接口聚合、裁剪成前端直接需要的 View Model，同时集中处理 Session、权限、缓存和协议转换。
 >
-> 我的 AI Agent 项目使用 Modern.js Integrated BFF。一次 `/api/chat` 请求进入后，BFF 会完成身份和 CSRF 校验、上下文与长期记忆查询、单 Agent/多 Agent 路由、Host 调度和 SSE 转换。核心优势不只是“少发几个请求”，而是把模型、权限和编排复杂度留在服务端，让 React 前端只消费稳定协议。
+> 我的 AI Agent 项目使用 Modern.js Integrated BFF。一次 `/api/chat` 请求进入后，BFF 会完成身份和 CSRF 校验、按 token 预算组装最近两轮/摘要/相关记忆、单 Agent/多 Agent 路由、Host 调度和 SSE 转换；模型结束后记录真实 usage，并异步触发记忆压缩。核心优势不只是“少发几个请求”，而是把模型、权限和编排复杂度留在服务端，让 React 前端只消费稳定协议。
 
 ## 90 秒回答
 

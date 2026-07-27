@@ -31,7 +31,7 @@
 >
 > 编排上把任务拆成 Planner、Critic、Host、Reporter 四个职责。Critic 输出结构化有效性和风险，确定性的 Host 策略再决定下一轮真正执行哪个 Agent，而不是始终跑固定链路。传输上由 BFF 调模型并通过 TransformStream 返回 SSE，前端用 TextDecoder 增量解码，把 chunk 进入 buffer，再由 requestAnimationFrame 按帧 flush，避免每个 token 都触发 React 和 Markdown 重算。
 >
-> 长会话前端用虚拟列表控制 DOM 数量；服务端采用最近窗口加混合历史检索，结合 BM25、Embedding、RRF、时间和重要性重排。BFF 还负责密钥保护、上下文拼接、鉴权、限流和流式转发。项目重点不是接一个聊天接口，而是把模型的不确定输出放进可校验、可降级的工程链路。
+> 长会话前端用虚拟列表控制 DOM 数量，LocalStorage 只缓存最近 10 轮用于秒开；MongoDB `messages` 保存完整原文。服务端异步生成切片、Embedding 和带来源消息 ID 的长期摘要，构建上下文时再按 token 预算装入最近两轮、摘要和相关记忆。BFF 还负责密钥保护、上下文拼接、鉴权、限流和流式转发。项目重点不是接一个聊天接口，而是把模型的不确定输出放进可校验、可降级的工程链路。
 
 ## 一次“生成学习计划”的完整链路
 
@@ -41,14 +41,14 @@
 4. 编排器把 `next_agents` 当作下一轮真实指令：可能只执行 Planner，也可能只执行 Critic，然后 Host 再判断。
 5. 满足结构化终止条件走 `finalize`；达到最大轮次走 `terminate`，都由 Reporter 生成最终结果，但后者必须披露剩余风险。
 6. 每轮 history、`next_agents` 和 Host 趋势状态写入 `multi_agent_sessions`，支持断点恢复；生成过程通过 SSE 返回。
-7. 最终消息写入 `messages`；后台异步派生 `memory_items` 索引，索引失败不阻断用户主链路。
+7. 最终消息同步写入 `messages`；后台异步派生 `memory_items` 和 `memory_summaries`。索引或摘要失败不阻断用户主链路，也不会删除原始消息。
 
 分层职责一句话：
 
 - 前端：会话 UI、流式展示、取消、错误态和卡片渲染。
 - BFF：密钥保护、鉴权、限流、上下文组装、编排和流式转发。
 - Agent：Planner 规划、Critic 校验、Reporter 表达；Host 用代码策略控制状态迁移。
-- 存储：`messages` 是原始消息事实源，`memory_items` 是可重建检索索引，`multi_agent_sessions` 是带 TTL 的短期执行检查点。
+- 存储：LocalStorage 是最近 10 轮的秒开缓存；`messages` 是原始消息事实源；`memory_items` 和 `memory_summaries` 是可重建派生层；`conversation_token_states` 是 token 双账本；`multi_agent_sessions` 是带 TTL 的短期执行检查点。
 - 当前边界：没有把独立 run 表、完整工具审计和任务队列说成已实现。
 - 企业化改造：补持久化 run、Outbox/队列、角色级工具权限、审计和基于 runId 的进度订阅。
 
@@ -175,27 +175,107 @@ Planner刚修订 -> verify(Critic)
 | 方案 | 优点 | 问题 |
 | --- | --- | --- |
 | 全量历史拼接 | 实现简单，不丢显式上下文 | token、延迟持续增长，噪声增加 |
-| 滚动摘要 | 上下文稳定、成本低 | 摘要可能丢细节，错误会累积 |
-| 最近窗口 + 历史检索 | 保留近期连贯性，按需召回旧信息 | 依赖切分、Embedding 和召回质量 |
+| 滚动摘要 | 上下文稳定、成本低 | 摘要可能丢细节；如果覆盖原文，错误会累积且不可恢复 |
+| 最近窗口 + 派生摘要 + 历史检索 | 近期连续、旧事实可召回、摘要可重建 | 多一套异步任务、状态机和一致性处理 |
 
-本项目已实现“最近窗口 + 混合历史检索”：
+本项目采用“原文事实源 + 两类派生记忆 + token 预算装箱”：
 
-1. `messages` 保存原始对话，是事实源。
-2. 新消息保存成功后，在后台按 1200 字符、120 字符重叠切片，写入可重建的 `memory_items`。
-3. 配置了火山 Embedding 时写入向量；Embedding 失败仍保留全文检索数据，不阻断消息主链路。
-4. 查询时先保留最近窗口，再从窗口之外做 BM25/关键词与向量召回，用 RRF 合并名次，再按相关性、时间衰减和重要性重排。
-5. 默认最终取 5 条历史记忆；相关性、时间、重要性权重为 0.7/0.1/0.2，半衰期 30 天。这些是当前默认值，不是通用最优值。
+1. 浏览器 LocalStorage 只保留最近 10 轮完整消息，用于页面秒开；离线产生但尚未同步的消息是保护性例外。它不是长期事实源。
+2. MongoDB `messages` 保存所有原始消息。记忆压缩只新增派生数据，不因“已经总结”而删除消息；用户主动删除会话是另一条数据生命周期。
+3. 新消息落库后，后台按 1200 字符、120 字符重叠切片，写入 `memory_items` 并生成 Embedding。Embedding 失败仍保留全文检索数据，不阻断聊天。
+4. 新增原文达到阈值或上下文压力升高时，后台摘要任务读取尚未总结的旧消息，提取目标、偏好和约束，写入 `memory_summaries`。每条摘要都带 `sourceMessageIds`、起止消息 ID、原文/摘要 token 数和模型版本。
+5. 查询时做 BM25/关键词与向量召回，用 RRF 合并名次，再按相关性、时间衰减和重要性重排。
+6. 构建上下文前先算输入预算；最近两轮原文是强制项，摘要和长期记忆按“相关性价值 / token 成本”装入，预算用完立即停止。
+
+LocalStorage 常被说成“约 5MB”，但这只是不同浏览器、不同 origin 下常见的配额量级，不是可靠的业务协议。不能先把它塞满再考虑迁移；本项目直接按消息轮数限制为 10 轮，容量只作为异常保护。
+
+### token 到底怎么算
+
+不能把每轮 `total_tokens` 累加后直接和模型上下文窗口比较。历史消息会在多轮请求中反复发送，累计值会重复计数，它表示账单，不表示下一轮上下文大小。
+
+本项目使用三种口径：
+
+- **调用前预算**：没有真实 usage，只能对 system prompt、当前消息、工具 Schema 和候选历史做保守估算。
+- **调用后校准**：OpenAI 兼容接口请求 `stream_options.include_usage=true`，读取流末尾的 `prompt_tokens / completion_tokens / total_tokens`；Ollama 映射 `prompt_eval_count / eval_count`。
+- **新增原文量**：只估算本轮新写入的 user + assistant 原文，累加到 `unsummarizedTokens`，不把重复发送的历史算进去。
+
+输入预算公式：
+
+```text
+inputBudget = contextWindow
+              - outputReserve
+              - ceil(contextWindow × safetyMarginRatio)
+```
+
+然后：
+
+```text
+historyBudget = inputBudget
+                - systemPromptTokens
+                - currentMessageTokens
+                - toolSchemaTokens
+```
+
+状态结构：
+
+```ts
+{
+  conversationId: "conv-123",
+
+  // 上一轮实际输入；供应商不返回 usage 时才用估算值
+  lastInputTokens: 7200,
+
+  // 所有模型调用的累计账单，用于成本统计，不用于判断当前上下文
+  lifetimeBillableTokens: 32500,
+
+  // 上次长期摘要之后新增长的原始 user + assistant 内容
+  unsummarizedTokens: 4600,
+
+  summarizedThroughMessageId: "msg-88",
+  compressionStatus: "idle" // idle | running | failed
+}
+```
+
+当前默认在 `unsummarizedTokens >= 4000`，或上一轮输入达到可用输入预算的 65% 时尝试启动后台摘要；先用 MongoDB 原子更新抢占任务，避免同一会话重复压缩。阈值是工程初值，应该根据摘要质量、P95 延迟和 token 成本调参。
+
+### 摘要任务没跑完，用户又提问
+
+用户请求不等待后台摘要，按状态降级：
+
+```text
+已有可用摘要
+→ 最近 2 轮原文 + 摘要 + 相关长期记忆
+
+compressionStatus = running
+→ 最近 2 轮原文 + 已有摘要/记忆
+→ 按相关性/token 成本删除低价值片段
+→ 压力仍高且没有可用摘要时，临时同步压缩；失败则直接截断低价值项
+
+compressionStatus = failed
+→ 从 MongoDB messages / memory_items 继续做原文全文或混合检索
+```
+
+后台任务超过 10 分钟仍为 `running` 时允许其他 worker 重新抢占；失败会记录错误和重试时间。摘要始终只是加速与压缩层，绝不能成为唯一事实源。
+
+### 两个候选方案怎么“拉踩”
+
+| 候选 | 方案 | 优点 | 被追问时的短板 |
+| --- | --- | --- | --- |
+| A：滚动摘要替换历史 | LocalStorage 留 5～10 轮；达到累计 token 阈值后，异步 Agent 分块总结；以后主要发送滚动摘要 | 代码和查询链路简单；上下文长度稳定；数据库体积和推理成本低 | 累计 `total_tokens` 重复计算历史，触发口径不准；摘要一旦漏掉否定、数字或约束会代代累积；若原文被覆盖则无法重建与审计；任务未完成时缺少可靠降级 |
+| B：事实源 + 派生记忆 + 双账本（本项目） | LocalStorage 10 轮秒开；Mongo 保存全部原文；切片/Embedding/结构化摘要均为派生层；调用前预算、调用后 usage 校准；按相关性/token 装箱 | 可重建、可追溯；摘要失败仍能查原文；区分成本账本与上下文压力；能明确回答并发摘要和失败问题 | Mongo 与派生索引占用更高；要处理最终一致性、任务抢占、重试、索引版本和质量评测；实现复杂度明显高 |
+
+面试结论：A 适合低风险、短生命周期、允许信息损失的聊天；B 适合目标、偏好、约束会影响后续行为的 Agent。不是说 A 错，而是 B 用额外存储和工程复杂度换取可恢复性与可审计性。
 
 为什么用 RRF：BM25 分数和余弦相似度不在同一量纲，直接相加难校准；RRF 只利用各路排名，先得到稳定融合结果，再叠加时间和重要性。
 
 生产与本地的差别：配置 Atlas Search/Vector Search 索引时在数据库侧召回；没有索引时会在最多 500 条候选内做应用层 BM25 和余弦计算，方便本地运行，但 QPS 上升后应切数据库原生索引。项目提供建索引和历史回填脚本，但不能说已经在生产数据执行。
 
-### 为什么拆 `messages` 和 `memory_items`
+### 为什么拆 `messages`、`memory_items` 和 `memory_summaries`
 
-- `messages` 保证原文、顺序和会话展示；`memory_items` 面向切片、Embedding 版本和检索排序。
+- `messages` 保证原文、顺序和会话展示；`memory_items` 面向切片、Embedding 版本和检索排序；`memory_summaries` 面向压缩和目标/偏好/约束提取。
 - 一条长消息可能对应多个记忆块，直接把检索字段塞回消息会让模型和索引演进互相影响。
-- 派生索引可以按 `messageId + chunkIndex` 幂等重建；Embedding 模型升级时只重建索引，不改事实源。
-- 代价是最终一致性。当前采用后台异步索引，失败只记录日志；生产化还需补重试队列、删除/更新 tombstone 和索引积压监控。
+- 派生索引可以按 `messageId + chunkIndex` 幂等重建；摘要用来源 ID 的哈希保证幂等。Embedding 或摘要模型升级时只重建派生层，不改事实源。
+- 代价是最终一致性。当前有后台执行、失败状态和延迟重抢；生产化还应把进程内后台任务升级为持久队列/Outbox，并补积压、重试和摘要质量监控。
 
 ### 前端直连、API 网关与 BFF
 
