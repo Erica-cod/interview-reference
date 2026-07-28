@@ -302,7 +302,7 @@ erDiagram
 
 - 第一轮执行 Planner 和 Critic。
 - 有高风险时，Host 只调度 Planner 修订。
-- Planner 单独修订后，Host 只调度 Critic 验证。
+- 轮次预算允许时，Planner 单独修订后，Host 只调度 Critic 验证；最大轮次优先终止并披露风险。
 - 首轮高共识且结构检查已通过时，追加一次 Critic 压力测试。
 - 结构门槛全部通过后进入 Reporter。
 
